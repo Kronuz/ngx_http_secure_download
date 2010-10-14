@@ -6,23 +6,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <mhash.h>
-#include <openssl/md5.h>
-#include <ctype.h>
+#include <ngx_md5.h>
 
 #define FOLDER_MODE 0
 #define FILE_MODE 1
 
-typedef struct {
-  const char *timestamp;
-  const char *md5;
-  const char *path;
-  int path_len;
-  int path_to_hash_len;
-} ngx_http_secure_download_split_uri_t;
-
-static ngx_int_t ngx_http_secure_download_split_uri (ngx_http_request_t*, ngx_http_secure_download_split_uri_t*);
-static ngx_int_t ngx_http_secure_download_check_hash(ngx_http_request_t*, ngx_http_secure_download_split_uri_t*, ngx_str_t*);
 static void * ngx_http_secure_download_create_loc_conf(ngx_conf_t*);
 static char * ngx_http_secure_download_merge_loc_conf (ngx_conf_t*, void*, void*);
 static ngx_int_t ngx_http_secure_download_init(ngx_conf_t*);
@@ -33,14 +21,23 @@ static char *ngx_http_secure_download_secret(ngx_conf_t *cf, void *post, void *d
 static ngx_conf_post_handler_pt  ngx_http_secure_download_secret_p =
     ngx_http_secure_download_secret;
 
+static char *ngx_http_secure_download_key(ngx_conf_t *cf, void *post, void *data);
+static ngx_conf_post_handler_pt  ngx_http_secure_download_key_p =
+    ngx_http_secure_download_key;
+
 typedef struct {
   ngx_flag_t enable;
   ngx_flag_t path_mode;
   ngx_str_t secret;
   ngx_array_t  *secret_lengths;
   ngx_array_t  *secret_values;
+  ngx_str_t key;
+  ngx_array_t  *key_lengths;
+  ngx_array_t  *key_values;
   ngx_str_t fail_location;
 } ngx_http_secure_download_loc_conf_t;
+
+static ngx_int_t ngx_http_secure_download_check_hash(ngx_http_request_t*, ngx_http_secure_download_loc_conf_t*, ngx_str_t*, ngx_str_t*);
 
 static ngx_command_t ngx_http_secure_download_commands[] = {
   {
@@ -66,6 +63,14 @@ static ngx_command_t ngx_http_secure_download_commands[] = {
     NGX_HTTP_LOC_CONF_OFFSET,
     offsetof(ngx_http_secure_download_loc_conf_t, secret),
     &ngx_http_secure_download_secret_p
+  },
+  {
+    ngx_string("secure_download_key"),
+    NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+    ngx_conf_set_str_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_secure_download_loc_conf_t, key),
+    &ngx_http_secure_download_key_p
   },
   {
     ngx_string("secure_download_fail_location"),
@@ -138,6 +143,7 @@ static void * ngx_http_secure_download_create_loc_conf(ngx_conf_t *cf)
   conf->path_mode = NGX_CONF_UNSET;
   conf->secret.data = NULL;
   conf->secret.len = 0;
+  conf->key.data = NULL;
   conf->fail_location.data = NULL;
   conf->fail_location.len = 0;
   return conf;
@@ -151,6 +157,7 @@ static char * ngx_http_secure_download_merge_loc_conf (ngx_conf_t *cf, void *par
   ngx_conf_merge_value(conf->enable, prev->enable, 0);
   ngx_conf_merge_value(conf->path_mode, prev->path_mode, FOLDER_MODE);
   ngx_conf_merge_str_value(conf->secret, prev->secret, "");
+  ngx_conf_merge_str_value(conf->key, prev->key, "");
   ngx_conf_merge_str_value(conf->fail_location, prev->fail_location, "");
   
   if (conf->enable == 1) {
@@ -185,13 +192,13 @@ static ngx_int_t ngx_http_secure_download_init(ngx_conf_t *cf)
   return NGX_OK;
 }
 
-static ngx_int_t ngx_http_secure_download_handler (ngx_http_request_t *r)
+static ngx_int_t ngx_http_secure_download_handler(ngx_http_request_t *r)
 {
   unsigned timestamp;
   ngx_http_secure_download_loc_conf_t *sdc;
-  ngx_http_secure_download_split_uri_t sdsu;
-  ngx_str_t rel_path;
   ngx_str_t secret;
+  ngx_str_t key;
+  ngx_uint_t i;
 
   sdc = ngx_http_get_module_loc_conf(r, ngx_http_secure_download_module);
   if ((sdc->enable != 1) || (r->internal > 0))
@@ -201,17 +208,31 @@ static ngx_int_t ngx_http_secure_download_handler (ngx_http_request_t *r)
 
   if (!sdc->secret_lengths || !sdc->secret_values) {
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-    "securedownload: module enabled, but secret key not configured!");
+        "securedownload: module enabled, but secret key not configured!");
     return NGX_HTTP_FORBIDDEN;
   }
 
-  if (ngx_http_secure_download_split_uri(r, &sdsu) == NGX_ERROR)
-  {
-    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "received an error from ngx_http_secure_download_split_uri", 0);
-    return ngx_http_internal_redirect(r, &sdc->fail_location, &r->args);
+  if (!sdc->key_lengths || !sdc->key_values) {
+    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+        "securedownload: secure_download_key is required, but not set!");
+    return NGX_HTTP_FORBIDDEN;
+  }
+  if (ngx_http_script_run(r, &key, sdc->key_lengths->elts, 0, sdc->key_values->elts) == NULL) {
+      ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+          "securedownload: evaluation failed");
+      return NGX_ERROR;
+  }
+  if (key.len != 40) {
+    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+        "securedownload: secure_download_key is required, but it's invalid!");
+    return NGX_HTTP_FORBIDDEN;
   }
 
-  if (sscanf(sdsu.timestamp, "%08X", &timestamp) != 1)
+  for (i = 0; i < key.len; i++) {
+    key.data[i] = ngx_tolower(key.data[i]);
+  }
+  
+  if (sscanf((const char *)&key.data[32], "%08x", &timestamp) != 1)
   {
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "error in timestamp hex-dec conversion", 0);
     return ngx_http_internal_redirect(r, &sdc->fail_location, &r->args);
@@ -227,17 +248,12 @@ static ngx_int_t ngx_http_secure_download_handler (ngx_http_request_t *r)
           "securedownload: evaluation failed");
       return NGX_ERROR;
   }
-  ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-    "securedownload: evaluated value of secret: \"%V\"", &secret);
     
-  if (ngx_http_secure_download_check_hash(r, &sdsu, &secret) == NGX_ERROR)
+  if (ngx_http_secure_download_check_hash(r, sdc, &secret, &key) == NGX_ERROR)
   {
-    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "bad hash", 0);
     return ngx_http_internal_redirect(r, &sdc->fail_location, &r->args);
   }
-  rel_path.data = r->uri.data;
-  rel_path.len = sdsu.path_len;
-  return ngx_http_internal_redirect(r, &rel_path, &r->args);
+  return ngx_http_internal_redirect(r, &(r->uri), &r->args);
 }
 
 //////////////////////
@@ -271,110 +287,77 @@ ngx_http_secure_download_secret(ngx_conf_t *cf, void *post, void *data)
 
     return ngx_http_secure_download_compile_secret(cf, sdc);
 }
-////////////////////////
-
-static ngx_int_t ngx_http_secure_download_check_hash(ngx_http_request_t *r, ngx_http_secure_download_split_uri_t *sdsu, ngx_str_t *secret)
+static char *
+ngx_http_secure_download_compile_key(ngx_conf_t *cf, ngx_http_secure_download_loc_conf_t *sdc)
 {
-  int i;
-  unsigned char generated_hash[16];
-  char hash[33];
-  MHASH td;
-  char *hash_data, *str;
-  int data_len;
 
-  static const char xtoc[] = "0123456789abcdef";
+    ngx_http_script_compile_t   sc;
+    ngx_memzero(&sc, sizeof(ngx_http_script_compile_t));
 
-  /* rel_path_to_hash/secret/timestamp\0 */
+    sc.cf = cf;
+    sc.source = &sdc->key;
+    sc.lengths = &sdc->key_lengths;
+    sc.values = &sdc->key_values;
+    sc.variables = ngx_http_script_variables_count(&sdc->key);
+    sc.complete_lengths = 1;
+    sc.complete_values = 1;
 
-  data_len = sdsu->path_to_hash_len + secret->len + 10;
+    if (ngx_http_script_compile(&sc) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
 
-  hash_data = malloc(data_len + 1);
-  if (hash_data == NULL)
-  {
-    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "error in allocating memory for string_to_hash.data", 0);
-    return NGX_ERROR;
-  }
-
-  str = hash_data;
-  memcpy(str, sdsu->path, sdsu->path_to_hash_len);
-  str += sdsu->path_to_hash_len;
-  *str++ = '/';
-  memcpy(str, secret->data, secret->len);
-  str += secret->len;
-  *str++ = '/';
-  memcpy(str, sdsu->timestamp, 8);
-  str[8] = 0;
-
-  td = mhash_init(MHASH_MD5);
-
-  if (td == MHASH_FAILED)
-  {
-	free(hash_data);
-    return NGX_ERROR;
-  }
-  ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "hashing string \"%s\" with len %i", hash_data, data_len);
-  mhash(td, hash_data, data_len);
-  mhash_deinit(td, generated_hash);
-
-  free(hash_data);
-
-  for (i = 0; i < 16; ++i) {
-	  hash[2 * i + 0] = xtoc[generated_hash[i] >> 4];
-	  hash[2 * i + 1] = xtoc[generated_hash[i] & 0xf];
-  }
-  
-  hash[32] = 0; //because %.32 doesn't work
-  ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "computed hash: %32s", hash); 
-  // ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "hash from uri: %.32s", sdsu->md5);
-
-  if(memcmp(hash, sdsu->md5, 32) != 0) {
-	  ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "hash mismatch", 0); 	  
-	  return NGX_ERROR;
-  }
-
-  return NGX_OK;
+    return NGX_CONF_OK;
 }
 
-static ngx_int_t ngx_http_secure_download_split_uri(ngx_http_request_t *r, ngx_http_secure_download_split_uri_t *sdsu)
+static char *
+ngx_http_secure_download_key(ngx_conf_t *cf, void *post, void *data)
 {
-  int md5_len = 0;
-  int tstamp_len = 0;
+    ngx_http_secure_download_loc_conf_t *sdc =
+	    ngx_http_conf_get_module_loc_conf(cf, ngx_http_secure_download_module);
+
+    return ngx_http_secure_download_compile_key(cf, sdc);
+}
+////////////////////////
+
+static ngx_int_t ngx_http_secure_download_check_hash(ngx_http_request_t *r, ngx_http_secure_download_loc_conf_t *sdc, ngx_str_t *secret, ngx_str_t *key)
+{
+  ngx_uint_t i;
+  unsigned char hash[16];
+  ngx_int_t n;
+  ngx_md5_t md5;
+
   int len = r->uri.len;
   const char *uri = (char*)r->uri.data;
-
-  ngx_http_secure_download_loc_conf_t *sdc = ngx_http_get_module_loc_conf(r, ngx_http_secure_download_module);
-
-  while(len && uri[--len] != '/')
-	  ++tstamp_len;
-  if(tstamp_len != 8) {
-	  ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "timestamp size mismatch: %d", tstamp_len);
-	  return NGX_ERROR;
-  }
-  sdsu->timestamp = uri + len + 1;
-
-  while(len && uri[--len] != '/')
-	  ++md5_len;
-  if(md5_len != 32) {
-	  ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "md5 size mismatch: %d", md5_len);
-	  return NGX_ERROR;
-  }
-  sdsu->md5 = uri + len + 1;
-
-  if(len == 0) {
-	  ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "bad path", 0);
-	  return NGX_ERROR;
-  }
-
-  sdsu->path = uri;
-  sdsu->path_len = len;
-
   if(sdc->path_mode == FOLDER_MODE) {
 	  while(len && uri[--len] != '/');
   }
-  sdsu->path_to_hash_len = len;
+  
+  char debug_hash[41];
+  static const char xtoc[] = "0123456789abcdef";
+
+  // 32 bytes of the hash + 8 bytes of hex epoch timestamp
+  // aabbccddeeffaabbccddeeffaabbccdd00112233
+  
+  ngx_md5_init(&md5);
+  ngx_md5_update(&md5, uri, len);
+  ngx_md5_update(&md5, secret->data, secret->len);
+  ngx_md5_update(&md5, &key->data[32], 8);
+  ngx_md5_final(hash, &md5);
+  //ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "hashing string \"%x\"", hash);
+
+  for (i = 0; i < 16; i++) {
+    n = ngx_hextoi(&key->data[2*i], 2);
+    if (n == NGX_ERROR || n != hash[i]) {
+      for (i = 0; i < 16; ++i) {
+	    debug_hash[2 * i + 0] = xtoc[hash[i] >> 4];
+	    debug_hash[2 * i + 1] = xtoc[hash[i] & 0xf];
+      }
+      memcpy(&debug_hash[32], &key->data[32], 8);
+      debug_hash[40] = 0;
+      ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "key mismatch, should be: \"%s\"", debug_hash);
+      return NGX_ERROR;
+    }
+  }
 
   return NGX_OK;
 }
-
-
-
